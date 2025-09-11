@@ -7,57 +7,201 @@ import Order from "../models/Order.js";
 import {uploadImageToCloudinary} from '../utils/imageUploader.js'
 import twilio from 'twilio';
 import dotenv from "dotenv";
+import { sendOtpEmail } from "../utils/sendEmail.js";
 dotenv.config();
 
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 // Register User : /api/user/register
-export const register = async (req, res)=>{
-    try {
-        const { name, phone, password } = req.body;
+export const register = async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
 
-        if(!name || !phone || !password){
-            return res.json({success: false, message: 'Missing Details'})
-        }
+    if (!name || !email || !password) {
+      return res.status(400).json({ success: false, message: "Missing details" });
+    }
 
-        const existingUser = await User.findOne({phone})
+    let user = await User.findOne({ "profile.email": email });
 
-        if(existingUser)
-            return res.json({success: false, message: 'User already exists'})
+    // Generate OTP + expiry
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiry = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-        const hashedPassword = await bcrypt.hash(password, 10)
+    if (user) {
+      // If user already exists
+      if (user.isActive) {
+        return res.status(400).json({ success: false, message: "User already exists and is active. Please login." });
+      }
 
-        const user = await User.create({name, phone, password: hashedPassword})
+      // User exists but inactive → reset password + send fresh OTP
+      user.name = name; // in case they update name
+      user.password = hashedPassword;
+      user.otp = otp;
+      user.otpExpires = expiry;
+      user.isActive = false;
 
-        const token = jwt.sign({id: user._id}, process.env.JWT_SECRET, {expiresIn: '7d'});
+      await user.save();
+      await sendOtpEmail({ email, fullName: user.name, otp });
 
-        res.cookie('token', token, {
+      return res.status(200).json({
+        success: true,
+        message: "OTP re-sent to your email. Please verify to activate account.",
+      });
+    }
+
+    // New user
+    user = await User.create({
+      name,
+      "profile.email": email,
+      password: hashedPassword,
+      otp,
+      otpExpires: expiry,
+      isActive: false,
+    });
+
+    await sendOtpEmail({ email, fullName: user.name, otp });
+
+    return res.status(201).json({
+      success: true,
+      message: "Account created. OTP sent to your email.",
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.profile.email,
+        accountType: user.accountType,
+      },
+    });
+
+  } catch (error) {
+    console.error("Register error:", error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+
+export const verifyOtp = async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+      return res.status(400).json({ success: false, message: "Email and OTP are required" });
+    }
+
+    // Find user by profile.email
+    const user = await User.findOne({ "profile.email": email });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    // Check OTP and expiry
+    if (user.otp !== otp) {
+      return res.status(400).json({ success: false, message: "Invalid OTP" });
+    }
+
+    if (user.otpExpires < Date.now()) {
+      return res.status(400).json({ success: false, message: "OTP has expired" });
+    }
+
+    // OTP is valid → activate account
+    user.isActive = true;  // or `active` if you use that field
+    user.otp = undefined;
+    user.otpExpires = undefined;
+    await user.save();
+
+    // Optionally, generate JWT token
+     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+      res.cookie('token', token, {
             httpOnly: true, // Prevent JavaScript to access cookie
             secure: process.env.NODE_ENV === 'production', // Use secure cookies in production
             sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'strict', // CSRF protection
             maxAge: 7 * 24 * 60 * 60 * 1000, // Cookie expiration time
         })
 
-        return res.json({success: true, user: {phone: user.phone, name: user.name, token: token, accountType: user.accountType,_id:user._id}})
-    } catch (error) {
-        console.log(error.message);
-        res.json({ success: false, message: error.message });
+
+    return res.json({
+      success: true,
+      message: "OTP verified successfully. Account activated.",
+      user: {
+        _id: user._id,
+        email: user.profile.email,
+        name: user.name,
+        accountType: user.accountType,
+         token // uncomment if you want to return token
+      }
+    });
+
+  } catch (error) {
+    console.log(error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const sendOtpIfExpired = async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Email is required" });
     }
-}
+
+    const user = await User.findOne({ "profile.email": email });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    // If already active, no need for OTP
+    if (user.isActive) {
+      return res.status(400).json({ success: false, message: "Account already active" });
+    }
+
+    // If OTP still valid
+    if (user.otp && user.otpExpires > Date.now()) {
+      return res.json({ 
+        success: true, 
+        message: "OTP is still valid. Please check your email.", 
+        expiresAt: user.otpExpires 
+      });
+    }
+
+    // OTP expired → generate new OTP
+    const newOtp = Math.floor(100000 + Math.random() * 900000).toString();
+    const newExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
+
+    user.otp = newOtp;
+    user.otpExpires = newExpiry;
+    await user.save();
+
+    // Send OTP email
+    await sendOtpEmail({ email: user.profile.email, fullName: user.name, otp: newOtp });
+
+    return res.json({ 
+      success: true, 
+      message: "New OTP has been sent to your email", 
+      expiresAt: newExpiry 
+    });
+
+  } catch (error) {
+    console.log(error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+
 
 // Login User : /api/user/login
 
 export const login = async (req, res) => {
   try {
-    const { phone, password } = req.body;
+    const { email, password } = req.body;
 
-    if (!phone || !password) {
-      return res.status(400).json({ success: false, message: 'Phone and password are required' });
+    if (!email || !password) {
+      return res.status(400).json({ success: false, message: 'Email and password are required' });
     }
 
-    const user = await User.findOne({ phone });
+    const user = await User.findOne({ "profile.email":email });
 
     if (!user) {
-      return res.status(401).json({ success: false, message: 'Account is not available with this phone number' });
+      return res.status(401).json({ success: false, message: 'Account is not available with this email address' });
     }
     if(user.isActive === false){
       return res.status(403).json({ success: false, message: 'Your account is deactivated. Please contact support.' });
@@ -80,7 +224,7 @@ export const login = async (req, res) => {
     return res.status(200).json({
       success: true,
       user: {
-        phone: user.phone,
+        email: user?.profile?.email,
         name: user.name,
         accountType: user.accountType,
         token: token,
@@ -230,9 +374,9 @@ export const sendOTPToPhone = async (phone, otp) => {
 
 export const forgotPassword = async (req, res) => {
   try {
-    const { phone } = req.body;
+    const { email } = req.body;
 
-    const user = await User.findOne({ phone:phone });
+    const user = await User.findOne({ 'profile.email':email });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
@@ -242,9 +386,9 @@ export const forgotPassword = async (req, res) => {
     user.otpExpires = expiry;
     await user.save();
 
-     await sendOTPToPhone(phone, otp);
+     await sendOtpEmail({email: email, fullName: user.name, otp:otp})
 
-    res.json({ success: true, message: 'OTP sent to your phone' });
+    res.json({ success: true, message: 'OTP sent to your email' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -252,13 +396,13 @@ export const forgotPassword = async (req, res) => {
 
 export const resetPassword = async (req, res) => {
   try {
-    const { phone, otp, newPassword, confirmPassword } = req.body;
+    const { email, otp, newPassword, confirmPassword } = req.body;
 
 
 
     // Find the user
     
-    const user = await User.findOne({ phone });
+    const user = await User.findOne({ 'profile.email':email });
     if (!user) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
